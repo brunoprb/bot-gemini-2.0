@@ -7,12 +7,12 @@ from dataclasses import dataclass, asdict
 from typing import Dict, Optional, List, Any, Tuple
 from datetime import datetime, timezone
 
+import requests
 import ccxt
 import pandas as pd
 import numpy as np
 from ta.momentum import RSIIndicator
 from ta.trend import EMAIndicator
-from telegram import Bot
 
 # ----------------------------
 # Logging
@@ -42,13 +42,20 @@ class Config:
     max_open_positions: int = 5
 
     rsi_period: int = 14
-    rsi_threshold: float = 45.0
+    rsi_threshold: float = 50.0  # afrouxado (antes 45)
+
     ema_period: int = 200
     ema_band_low: float = 0.98
     ema_band_high: float = 1.01
 
-    take_profit_pct: float = 0.07
+    # Stop inicial (hard stop) enquanto trailing não arma
     stop_loss_pct: float = 0.08
+
+    # Trailing stop (após armar)
+    trailing_stop_pct: float = 0.04          # 4% abaixo do topo (peak)
+    # arma trailing quando subir +2% desde entrada
+    trailing_activate_pct: float = 0.02
+    trailing_update_alert: bool = False      # se True, avisa quando stop subir
 
     min_quote_volume_24h: float = 300_000.0
     top_symbols_limit: int = 300
@@ -60,6 +67,7 @@ class Config:
     positions_file: str = "positions.json"
     history_file: str = "trade_history.json"
     equity_file: str = "equity_curve.json"
+    tg_offset_file: str = "tg_offset.json"
 
 
 def load_config() -> Config:
@@ -85,11 +93,13 @@ def load_config() -> Config:
 class Position:
     symbol: str
     entry: float
-    target: float
     stop: float
     amount: float
     opened_at: float
     usdt_invested: float = 0.0
+
+    peak: float = 0.0
+    trailing_armed: bool = False
 
 
 @dataclass
@@ -118,8 +128,12 @@ class EquitySnapshot:
     losing_trades: int
 
 # ----------------------------
-# Persistence
+# Persistence helpers (tolerantes a mudanças de schema)
 # ----------------------------
+
+
+def _pick(d: Dict[str, Any], keys: List[str]) -> Dict[str, Any]:
+    return {k: d[k] for k in keys if k in d}
 
 
 def load_positions(path: str) -> Dict[str, Position]:
@@ -128,9 +142,17 @@ def load_positions(path: str) -> Dict[str, Position]:
     try:
         with open(path, "r", encoding="utf-8") as f:
             raw = json.load(f)
+
         out: Dict[str, Position] = {}
         for symbol, p in raw.items():
-            out[symbol] = Position(**p)
+            # tolera arquivos antigos com campos extras (ex.: target)
+            allowed = _pick(p, [
+                "symbol", "entry", "stop", "amount", "opened_at",
+                "usdt_invested", "peak", "trailing_armed"
+            ])
+            # garante symbol
+            allowed["symbol"] = allowed.get("symbol") or symbol
+            out[symbol] = Position(**allowed)
         return out
     except Exception as e:
         logger.error(f"Falha ao carregar posições de {path}: {e}")
@@ -188,28 +210,39 @@ def save_equity_curve(path: str, equity: List[EquitySnapshot]) -> None:
         logger.error(f"Falha ao salvar curva de equity em {path}: {e}")
 
 # ----------------------------
-# Telegram
+# Telegram (síncrono via HTTP)
 # ----------------------------
 
 
 class TelegramAlerter:
     def __init__(self, token: str, chat_id: str):
-        self.bot = Bot(token=token)
-        self.chat_id = chat_id
+        self.token = token
+        self.chat_id = str(chat_id)
         self._last_error_sent_at = 0.0
 
     def send(self, msg: str) -> None:
         try:
-            max_len = 4000
+            url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+            payload = {
+                "chat_id": self.chat_id,
+                "text": msg,
+                "disable_web_page_preview": True,
+            }
+
+            # quebra em pedaços se ficar grande demais
+            max_len = 3800
             if len(msg) <= max_len:
-                self.bot.send_message(
-                    chat_id=self.chat_id, text=msg, disable_web_page_preview=True)
-            else:
-                for i in range(0, len(msg), max_len):
-                    chunk = msg[i:i+max_len]
-                    self.bot.send_message(
-                        chat_id=self.chat_id, text=chunk, disable_web_page_preview=True)
-                    time.sleep(0.5)
+                r = requests.post(url, json=payload, timeout=20)
+                r.raise_for_status()
+                return
+
+            for i in range(0, len(msg), max_len):
+                chunk = msg[i:i + max_len]
+                payload["text"] = chunk
+                r = requests.post(url, json=payload, timeout=20)
+                r.raise_for_status()
+                time.sleep(0.4)
+
         except Exception as e:
             logger.error(f"Erro Telegram: {e}")
 
@@ -220,12 +253,74 @@ class TelegramAlerter:
         self._last_error_sent_at = now
         self.send(msg)
 
+
+class TelegramCommandPoller:
+    def __init__(self, token: str, chat_id: str, state_file: str):
+        self.token = token
+        self.chat_id = str(chat_id)
+        self.state_file = state_file
+        self.offset = self._load_offset()
+
+    def _load_offset(self) -> int:
+        try:
+            if os.path.exists(self.state_file):
+                with open(self.state_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return int(data.get("offset", 0))
+        except Exception:
+            pass
+        return 0
+
+    def _save_offset(self) -> None:
+        try:
+            with open(self.state_file, "w", encoding="utf-8") as f:
+                json.dump({"offset": self.offset}, f)
+        except Exception:
+            pass
+
+    def poll(self, handle_message_fn) -> None:
+        try:
+            url = f"https://api.telegram.org/bot{self.token}/getUpdates"
+            params = {
+                "timeout": 0,
+                "offset": self.offset,
+                "allowed_updates": ["message"],
+            }
+            r = requests.get(url, params=params, timeout=20)
+            r.raise_for_status()
+            data = r.json()
+            updates = data.get("result", [])
+
+            for upd in updates:
+                upd_id = int(upd.get("update_id", 0))
+                self.offset = max(self.offset, upd_id + 1)
+
+                msg = upd.get("message") or {}
+                chat = msg.get("chat") or {}
+                chat_id = str(chat.get("id", ""))
+                if chat_id != self.chat_id:
+                    continue
+
+                text = (msg.get("text") or "").strip()
+                if text:
+                    handle_message_fn(text)
+
+            if updates:
+                self._save_offset()
+
+        except Exception as e:
+            logger.warning(f"Falha ao poll Telegram updates: {e}")
+
 # ----------------------------
 # Utils: retry/backoff
 # ----------------------------
 
 
 def is_retryable_exception(exc: Exception) -> bool:
+    # NÃO faz retry em auth/permissão
+    if isinstance(exc, (ccxt.AuthenticationError, ccxt.PermissionDenied, ccxt.AccountSuspended)):
+        return False
+
     retryable_types = (
         ccxt.NetworkError,
         ccxt.ExchangeNotAvailable,
@@ -303,12 +398,8 @@ class BinanceClient:
         v = self.exchange.amount_to_precision(symbol, amount)
         return float(v)
 
-    def price_to_precision(self, symbol: str, price: float) -> float:
-        v = self.exchange.price_to_precision(symbol, price)
-        return float(v)
-
 # ----------------------------
-# Strategy (usando biblioteca 'ta' em vez de TA-Lib)
+# Strategy
 # ----------------------------
 
 
@@ -321,32 +412,32 @@ def ohlcv_to_df(ohlcv: List[List[float]]) -> pd.DataFrame:
     return df
 
 
-def compute_signal(df: pd.DataFrame, cfg: Config) -> Tuple[bool, float, float, float]:
+def compute_signal(df: pd.DataFrame, cfg: Config) -> Tuple[bool, float, float]:
+    """
+    Retorna: (ok, curr_price, initial_stop)
+    Sem take profit.
+    """
     if len(df) < max(cfg.ema_period, cfg.rsi_period) + 5:
-        return (False, 0.0, 0.0, 0.0)
+        return (False, 0.0, 0.0)
 
     close_series = df["Close"]
 
-    # Calcular RSI usando biblioteca 'ta'
     rsi_indicator = RSIIndicator(close=close_series, window=cfg.rsi_period)
-    rsi = rsi_indicator.rsi().iloc[-1]
+    rsi = float(rsi_indicator.rsi().iloc[-1])
 
-    # Calcular EMA usando biblioteca 'ta'
     ema_indicator = EMAIndicator(close=close_series, window=cfg.ema_period)
-    ema = ema_indicator.ema_indicator().iloc[-1]
+    ema = float(ema_indicator.ema_indicator().iloc[-1])
 
     curr_price = float(close_series.iloc[-1])
 
-    # Verificar se está na banda e RSI abaixo do threshold
     in_band = (ema * cfg.ema_band_low) <= curr_price <= (ema * cfg.ema_band_high)
     entry_ok = (rsi < cfg.rsi_threshold) and in_band
 
     if not entry_ok:
-        return (False, curr_price, 0.0, 0.0)
+        return (False, curr_price, 0.0)
 
-    target = curr_price * (1.0 + cfg.take_profit_pct)
-    stop = curr_price * (1.0 - cfg.stop_loss_pct)
-    return (True, curr_price, target, stop)
+    initial_stop = curr_price * (1.0 - cfg.stop_loss_pct)
+    return (True, curr_price, initial_stop)
 
 # ----------------------------
 # Symbol selection
@@ -363,9 +454,15 @@ def get_top_symbols(client: BinanceClient, cfg: Config) -> List[str]:
     for s, data in tickers.items():
         if not s.endswith("/USDT"):
             continue
-        if any(x in s for x in ["UP/", "DOWN/", "BEAR/", "BULL/"]):
+
+        # Bloquear EUR (stable)
+        if s.startswith("EUR/"):
             continue
         if s in blacklist:
+            continue
+
+        # Excluir tokens alavancados
+        if any(x in s for x in ["UP/", "DOWN/", "BEAR/", "BULL/"]):
             continue
 
         try:
@@ -386,8 +483,11 @@ def get_top_symbols(client: BinanceClient, cfg: Config) -> List[str]:
         if qv >= cfg.min_quote_volume_24h:
             symbols.append(s)
 
-    symbols_sorted = sorted(symbols, key=lambda x: float(
-        tickers[x].get("quoteVolume") or 0.0), reverse=True)
+    symbols_sorted = sorted(
+        symbols,
+        key=lambda x: float(tickers[x].get("quoteVolume") or 0.0),
+        reverse=True
+    )
     return symbols_sorted[:cfg.top_symbols_limit]
 
 # ----------------------------
@@ -450,25 +550,25 @@ class PerformanceTracker:
         stats = self.get_stats()
 
         report = "=" * 40 + "\n"
-        report += "📊 RELATÓRIO DE PERFORMANCE\n"
+        report += "RELATÓRIO DE PERFORMANCE\n"
         report += "=" * 40 + "\n\n"
 
         report += f"Total de Operações: {stats['total_trades']}\n"
-        report += f"✅ Ganhos: {stats['winning_trades']}\n"
-        report += f"❌ Perdas: {stats['losing_trades']}\n"
+        report += f"Ganhos: {stats['winning_trades']}\n"
+        report += f"Perdas: {stats['losing_trades']}\n"
         report += f"Taxa de Acerto: {stats['win_rate']:.2f}%\n\n"
 
-        report += f"💰 P&L Total: ${stats['total_pnl']:.2f} USDT\n"
-        report += f"📈 Média de Ganho: ${stats['avg_win']:.2f}\n"
-        report += f"📉 Média de Perda: ${stats['avg_loss']:.2f}\n"
-        report += f"🏆 Maior Ganho: ${stats['largest_win']:.2f}\n"
-        report += f"💔 Maior Perda: ${stats['largest_loss']:.2f}\n"
-        report += f"⚡ Fator de Lucro: {stats['profit_factor']:.2f}\n\n"
+        report += f"P&L Total: ${stats['total_pnl']:.2f} USDT\n"
+        report += f"Média de Ganho: ${stats['avg_win']:.2f}\n"
+        report += f"Média de Perda: ${stats['avg_loss']:.2f}\n"
+        report += f"Maior Ganho: ${stats['largest_win']:.2f}\n"
+        report += f"Maior Perda: ${stats['largest_loss']:.2f}\n"
+        report += f"Fator de Lucro: {stats['profit_factor']:.2f}\n\n"
 
         if self.equity_curve:
             latest = self.equity_curve[-1]
             report += "=" * 40 + "\n"
-            report += "💼 PATRIMÔNIO ATUAL\n"
+            report += "PATRIMÔNIO ATUAL\n"
             report += "=" * 40 + "\n"
             report += f"Equity Total: ${latest.total_equity_usdt:.2f}\n"
             report += f"Saldo Livre: ${latest.free_balance_usdt:.2f}\n"
@@ -480,22 +580,22 @@ class PerformanceTracker:
                 variation = latest.total_equity_usdt - first.total_equity_usdt
                 variation_pct = (variation / first.total_equity_usdt *
                                  100) if first.total_equity_usdt > 0 else 0
-                report += f"\n📊 Variação desde início: ${variation:.2f} ({variation_pct:+.2f}%)\n"
+                report += f"\nVariação desde início: ${variation:.2f} ({variation_pct:+.2f}%)\n"
 
         if self.trades:
             report += "\n" + "=" * 40 + "\n"
-            report += "📋 ÚLTIMAS 5 OPERAÇÕES\n"
+            report += "ÚLTIMAS 5 OPERAÇÕES\n"
             report += "=" * 40 + "\n"
 
             for trade in self.trades[-5:]:
                 dt = datetime.fromtimestamp(trade.closed_at, tz=timezone.utc)
-                emoji = "✅" if trade.pnl_usdt > 0 else "❌"
-                report += f"\n{emoji} {trade.symbol}\n"
-                report += f"   Entrada: ${trade.entry:.6f}\n"
-                report += f"   Saída: ${trade.exit:.6f}\n"
-                report += f"   P&L: ${trade.pnl_usdt:.2f} ({trade.pnl_pct:+.2f}%)\n"
-                report += f"   Motivo: {trade.reason}\n"
-                report += f"   Data: {dt.strftime('%Y-%m-%d %H:%M')} UTC\n"
+                tag = "WIN" if trade.pnl_usdt > 0 else "LOSS"
+                report += f"\n[{tag}] {trade.symbol}\n"
+                report += f"  Entrada: ${trade.entry:.6f}\n"
+                report += f"  Saída:   ${trade.exit:.6f}\n"
+                report += f"  P&L:     ${trade.pnl_usdt:.2f} ({trade.pnl_pct:+.2f}%)\n"
+                report += f"  Motivo:  {trade.reason}\n"
+                report += f"  Data:    {dt.strftime('%Y-%m-%d %H:%M')} UTC\n"
 
         return report
 
@@ -509,6 +609,9 @@ class TradingBot:
         self.cfg = cfg
         self.client = BinanceClient(cfg)
         self.alerts = TelegramAlerter(cfg.tg_bot_token, cfg.tg_chat_id)
+        self.cmd = TelegramCommandPoller(
+            cfg.tg_bot_token, cfg.tg_chat_id, cfg.tg_offset_file)
+
         self.positions: Dict[str, Position] = load_positions(
             cfg.positions_file)
         self.performance = PerformanceTracker(
@@ -584,15 +687,19 @@ class TradingBot:
         except Exception as e:
             logger.error(f"Erro ao tirar snapshot de equity: {e}")
 
-    def open_position(self, symbol: str, signal_price: float, target: float, stop: float) -> None:
+    def open_position(self, symbol: str, signal_price: float) -> None:
+        # 1 posição por par (máximo)
         if symbol in self.positions:
             return
+
+        # 5 posições no total (máximo)
         if not self.can_open_new_position():
             return
 
         try:
             market = self.client.market_info(symbol)
 
+            # minNotional / min cost
             min_cost = None
             limits = (market or {}).get("limits") or {}
             cost_limits = limits.get("cost") or {}
@@ -617,29 +724,30 @@ class TradingBot:
                     symbol).get("last") or signal_price
             avg_price = float(avg_price)
 
-            target_exec = avg_price * (1.0 + self.cfg.take_profit_pct)
+            # stop inicial (hard)
             stop_exec = avg_price * (1.0 - self.cfg.stop_loss_pct)
 
             pos = Position(
                 symbol=symbol,
                 entry=avg_price,
-                target=target_exec,
                 stop=stop_exec,
                 amount=amount,
                 opened_at=time.time(),
-                usdt_invested=self.cfg.trade_usdt
+                usdt_invested=self.cfg.trade_usdt,
+                peak=avg_price,
+                trailing_armed=False,
             )
             self.positions[symbol] = pos
             save_positions(self.cfg.positions_file, self.positions)
 
             self.alerts.send(
-                "✅ COMPRA EXECUTADA\n"
-                f"🚀 Ativo: {symbol}\n"
-                f"💰 Entrada: ${avg_price:.6f}\n"
-                f"🎯 Alvo: ${target_exec:.6f} (+{self.cfg.take_profit_pct*100:.1f}%)\n"
-                f"🛑 Stop: ${stop_exec:.6f} (-{self.cfg.stop_loss_pct*100:.1f}%)\n"
-                f"📦 Qtd: {amount:.8f}\n"
-                f"💵 Investido: ${self.cfg.trade_usdt:.2f}"
+                "COMPRA EXECUTADA\n"
+                f"Ativo: {symbol}\n"
+                f"Entrada: ${avg_price:.6f}\n"
+                f"Stop inicial: ${stop_exec:.6f} (-{self.cfg.stop_loss_pct*100:.1f}%)\n"
+                f"Trailing: {self.cfg.trailing_stop_pct*100:.1f}% (arma após +{self.cfg.trailing_activate_pct*100:.1f}%)\n"
+                f"Qtd: {amount:.8f}\n"
+                f"Investido: ${self.cfg.trade_usdt:.2f}"
             )
             logger.info(
                 f"Posição aberta em {symbol} | entry={avg_price} amount={amount}")
@@ -647,7 +755,7 @@ class TradingBot:
         except Exception as e:
             logger.error(f"Erro ao comprar {symbol}: {e}")
             self.alerts.send_error_throttled(
-                f"❌ ERRO COMPRA\nAtivo: {symbol}\nMotivo: {e}")
+                f"ERRO COMPRA\nAtivo: {symbol}\nMotivo: {e}")
 
     def close_position(self, symbol: str, price: float, reason: str) -> None:
         pos = self.positions.get(symbol)
@@ -689,16 +797,19 @@ class TradingBot:
             del self.positions[symbol]
             save_positions(self.cfg.positions_file, self.positions)
 
-            emoji = "✅" if pnl_usdt > 0 else "❌"
+            tag = "WIN" if pnl_usdt > 0 else "LOSS"
             self.alerts.send(
-                f"{emoji} VENDA EXECUTADA ({reason})\n"
-                f"🚀 Ativo: {symbol}\n"
-                f"💰 Entrada: ${pos.entry:.6f}\n"
-                f"💸 Saída: ${exit_price:.6f}\n"
-                f"📦 Qtd: {amount_precise:.8f}\n"
-                f"\n💵 P&L: ${pnl_usdt:.2f} ({pnl_pct:+.2f}%)\n"
-                f"💼 Investido: ${pos.usdt_invested:.2f}\n"
-                f"💰 Retorno: ${proceeds:.2f}"
+                f"VENDA EXECUTADA ({tag})\n"
+                f"Motivo: {reason}\n"
+                f"Ativo: {symbol}\n"
+                f"Entrada: ${pos.entry:.6f}\n"
+                f"Saída:   ${exit_price:.6f}\n"
+                f"Qtd: {amount_precise:.8f}\n"
+                f"Peak: ${pos.peak:.6f}\n"
+                f"Stop final: ${pos.stop:.6f}\n"
+                f"\nP&L: ${pnl_usdt:.2f} ({pnl_pct:+.2f}%)\n"
+                f"Investido: ${pos.usdt_invested:.2f}\n"
+                f"Retorno: ${proceeds:.2f}"
             )
             logger.info(
                 f"Posição encerrada {symbol} | reason={reason} | price={exit_price} | pnl=${pnl_usdt:.2f}")
@@ -706,7 +817,7 @@ class TradingBot:
         except Exception as e:
             logger.error(f"Erro ao vender {symbol}: {e}")
             self.alerts.send_error_throttled(
-                f"❌ ERRO VENDA\nAtivo: {symbol}\nMotivo: {e}")
+                f"ERRO VENDA\nAtivo: {symbol}\nMotivo: {e}")
 
     def monitor_exits(self) -> None:
         if not self.positions:
@@ -720,10 +831,43 @@ class TradingBot:
                     continue
 
                 pos = self.positions[symbol]
-                if last >= pos.target:
-                    self.close_position(symbol, last, "TAKE PROFIT 🎯")
-                elif last <= pos.stop:
-                    self.close_position(symbol, last, "STOP LOSS 🛑")
+                changed = False
+
+                # Atualiza topo (peak)
+                base_peak = pos.peak if pos.peak > 0 else pos.entry
+                if last > base_peak:
+                    pos.peak = last
+                    changed = True
+
+                # Armar trailing somente após +X% desde entrada
+                arm_price = pos.entry * (1.0 + self.cfg.trailing_activate_pct)
+                if (not pos.trailing_armed) and (last >= arm_price):
+                    pos.trailing_armed = True
+                    changed = True
+
+                # Se trailing armado, stop sobe com o peak (nunca desce)
+                if pos.trailing_armed:
+                    trail_stop = pos.peak * (1.0 - self.cfg.trailing_stop_pct)
+                    if trail_stop > pos.stop:
+                        pos.stop = trail_stop
+                        changed = True
+                        if self.cfg.trailing_update_alert:
+                            self.alerts.send(
+                                "TRAILING STOP ATUALIZADO\n"
+                                f"Ativo: {symbol}\n"
+                                f"Peak: {pos.peak:.6f}\n"
+                                f"Novo Stop: {pos.stop:.6f}"
+                            )
+
+                if changed:
+                    self.positions[symbol] = pos
+                    save_positions(self.cfg.positions_file, self.positions)
+
+                # Saída: stop (antes de armar = stop loss; depois de armar = trailing stop)
+                if last <= pos.stop:
+                    reason = "TRAILING STOP" if pos.trailing_armed else "STOP LOSS"
+                    self.close_position(symbol, last, reason)
+
             except Exception as e:
                 logger.warning(f"Falha monitorando saída {symbol}: {e}")
                 continue
@@ -741,29 +885,88 @@ class TradingBot:
                 continue
 
             try:
-                ok, curr_price, target, stop = compute_signal(df, self.cfg)
+                ok, curr_price, _initial_stop = compute_signal(df, self.cfg)
                 if ok:
                     logger.info(f"Sinal em {s} | price={curr_price:.6f}")
-                    self.open_position(s, curr_price, target, stop)
+                    self.open_position(s, curr_price)
             except Exception as e:
                 logger.warning(f"Erro na lógica {s}: {e}")
 
             time.sleep(self.cfg.rate_limit_sleep_seconds)
 
+    def format_status(self) -> str:
+        stats = self.performance.get_stats()
+        lines = []
+        lines.append("STATUS DO BOT")
+        lines.append(
+            f"Posições abertas: {len(self.positions)}/{self.cfg.max_open_positions}")
+        lines.append(
+            f"RSI<th: {self.cfg.rsi_threshold} | EMA{self.cfg.ema_period} band: {self.cfg.ema_band_low:.2f}-{self.cfg.ema_band_high:.2f}")
+        lines.append(
+            f"Trailing: {self.cfg.trailing_stop_pct*100:.1f}% | arma após +{self.cfg.trailing_activate_pct*100:.1f}%")
+        lines.append(
+            f"Trades: {stats['total_trades']} | WinRate: {stats['win_rate']:.2f}% | PnL total: ${stats['total_pnl']:.2f}")
+        lines.append("")
+
+        if not self.positions:
+            lines.append("Nenhuma posição aberta no momento.")
+            return "\n".join(lines)
+
+        lines.append("POSIÇÕES:")
+        for s, p in self.positions.items():
+            try:
+                last = float(self.client.fetch_ticker(s).get("last") or 0.0)
+            except Exception:
+                last = 0.0
+
+            pnl = (p.amount * last - p.usdt_invested) if last > 0 else 0.0
+            pnl_pct = (pnl / p.usdt_invested *
+                       100) if p.usdt_invested > 0 and last > 0 else 0.0
+            armed = "SIM" if p.trailing_armed else "NÃO"
+            arm_price = p.entry * (1.0 + self.cfg.trailing_activate_pct)
+
+            lines.append(
+                f"- {s}\n"
+                f"  Entry: {p.entry:.6f} | Last: {last:.6f}\n"
+                f"  Peak: {p.peak:.6f} | Stop: {p.stop:.6f}\n"
+                f"  Trailing armado: {armed} | Preço p/ armar: {arm_price:.6f}\n"
+                f"  PnL est.: ${pnl:.2f} ({pnl_pct:+.2f}%)"
+            )
+
+        return "\n".join(lines)
+
+    def handle_telegram_command(self, text: str) -> None:
+        cmd = text.split()[0].lower()
+
+        if cmd in ("/status", "status"):
+            self.alerts.send(self.format_status())
+            return
+
+        if cmd in ("/report", "report"):
+            self.alerts.send(self.performance.format_performance_report())
+            return
+
+        if cmd in ("/help", "help"):
+            self.alerts.send(
+                "Comandos:\n/status - resumo rápido\n/report - relatório completo\n/help - ajuda")
+            return
+
     def send_daily_report(self) -> None:
-        report = self.performance.format_performance_report()
-        self.alerts.send(report)
+        self.alerts.send(self.performance.format_performance_report())
 
     def run_forever(self) -> None:
         logger.info("🤖 BOT INICIADO (BINANCE SPOT)")
         self.alerts.send("🤖 Bot iniciado e online!")
 
+        # relatório inicial
         self.send_daily_report()
-
         last_daily_report = time.time()
 
         while True:
             try:
+                # comandos Telegram (ex.: /status)
+                self.cmd.poll(self.handle_telegram_command)
+
                 symbols = self.refresh_symbols_if_needed()
                 logger.info(
                     f"🔍 Varrendo {len(symbols)} ativos | posições abertas: {len(self.positions)}")
