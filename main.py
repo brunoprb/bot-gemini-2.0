@@ -38,7 +38,7 @@ class Config:
     timeframe: str = "4h"
     ohlcv_limit: int = 300
 
-    trade_usdt: float = 15.0
+    trade_usdt: float = 13.0  # ← REDUZIDO PARA $13
     max_open_positions: int = 5
 
     rsi_period: int = 14
@@ -448,17 +448,30 @@ def get_top_symbols(client: BinanceClient, cfg: Config) -> List[str]:
     client.load_markets()
     tickers = client.fetch_tickers()
 
-    blacklist = {"BUSD/USDT", "USDC/USDT", "DAI/USDT", "EUR/USDT", "GBP/USDT"}
+    # ← LISTA EXPANDIDA DE STABLECOINS/PEGGED
+    stablecoin_blacklist = {
+        "BUSD/USDT", "USDC/USDT", "DAI/USDT", "TUSD/USDT", "FDUSD/USDT",
+        "EUR/USDT", "EURI/USDT", "GBP/USDT", "AUD/USDT", "USDE/USDT", "USDP/USDT",
+        "PYUSD/USDT", "GUSD/USDT", "USDD/USDT", "USDN/USDT", "USDJ/USDT",
+        "PAX/USDT", "HUSD/USDT", "SUSD/USDT", "CUSD/USDT", "FRAX/USDT",
+        "USDX/USDT", "RSV/USDT", "VAI/USDT", "UST/USDT", "USTC/USDT",
+        "ALUSD/USDT", "LUSD/USDT", "MIM/USDT", "FEI/USDT", "RAI/USDT",
+        "DOLA/USDT", "BEAN/USDT", "OUSD/USDT", "FLEXUSD/USDT", "EURS/USDT"
+    }
+
     symbols: List[str] = []
 
     for s, data in tickers.items():
         if not s.endswith("/USDT"):
             continue
 
-        # Bloquear EUR (stable)
-        if s.startswith("EUR/"):
+        # Bloquear qualquer par começando com stablecoin ou fiat
+        base = s.split("/")[0].upper()
+        if base in ["EUR", "GBP", "AUD", "BUSD", "USDC", "DAI", "TUSD", "FDUSD", "USDE", "USDP", "PYUSD"]:
             continue
-        if s in blacklist:
+
+        # Bloquear par completo (ex.: USDE/USDT)
+        if s in stablecoin_blacklist:
             continue
 
         # Excluir tokens alavancados
@@ -900,8 +913,9 @@ class TradingBot:
         lines.append("STATUS DO BOT")
         lines.append(
             f"Posições abertas: {len(self.positions)}/{self.cfg.max_open_positions}")
+        lines.append(f"Trade size: ${self.cfg.trade_usdt}")
         lines.append(
-            f"RSI<th: {self.cfg.rsi_threshold} | EMA{self.cfg.ema_period} band: {self.cfg.ema_band_low:.2f}-{self.cfg.ema_band_high:.2f}")
+            f"RSI<{self.cfg.rsi_threshold} | EMA{self.cfg.ema_period} band: {self.cfg.ema_band_low:.2f}-{self.cfg.ema_band_high:.2f}")
         lines.append(
             f"Trailing: {self.cfg.trailing_stop_pct*100:.1f}% | arma após +{self.cfg.trailing_activate_pct*100:.1f}%")
         lines.append(
