@@ -1,0 +1,19 @@
+FROM python:3.11-slim
+
+# Evita problemas com buffering de logs
+ENV PYTHONUNBUFFERED=1
+
+# Pasta de trabalho dentro do container
+WORKDIR /app
+
+# Copia apenas requirements primeiro (melhora cache)
+COPY requirements.txt .
+
+# Instala dependências
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copia o restante do código
+COPY . .
+
+# Comando para rodar o bot
+CMD ["python", "main.py"]
