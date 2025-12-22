@@ -38,11 +38,11 @@ class Config:
     timeframe: str = "4h"
     ohlcv_limit: int = 300
 
-    trade_usdt: float = 13.0  # ← REDUZIDO PARA $13
+    trade_usdt: float = 13.0  # valor por trade em USDT
     max_open_positions: int = 5
 
     rsi_period: int = 14
-    rsi_threshold: float = 50.0  # afrouxado (antes 45)
+    rsi_threshold: float = 50.0  # mais frouxo
 
     ema_period: int = 200
     ema_band_low: float = 0.98
@@ -58,7 +58,7 @@ class Config:
     trailing_update_alert: bool = False      # se True, avisa quando stop subir
 
     min_quote_volume_24h: float = 300_000.0
-    top_symbols_limit: int = 300
+    top_symbols_limit: int = 400             # monitora até 400 moedas
     symbol_refresh_seconds: int = 15 * 60
 
     cycle_sleep_seconds: int = 60
@@ -145,12 +145,10 @@ def load_positions(path: str) -> Dict[str, Position]:
 
         out: Dict[str, Position] = {}
         for symbol, p in raw.items():
-            # tolera arquivos antigos com campos extras (ex.: target)
             allowed = _pick(p, [
                 "symbol", "entry", "stop", "amount", "opened_at",
                 "usdt_invested", "peak", "trailing_armed"
             ])
-            # garante symbol
             allowed["symbol"] = allowed.get("symbol") or symbol
             out[symbol] = Position(**allowed)
         return out
@@ -229,7 +227,6 @@ class TelegramAlerter:
                 "disable_web_page_preview": True,
             }
 
-            # quebra em pedaços se ficar grande demais
             max_len = 3800
             if len(msg) <= max_len:
                 r = requests.post(url, json=payload, timeout=20)
@@ -317,7 +314,6 @@ class TelegramCommandPoller:
 
 
 def is_retryable_exception(exc: Exception) -> bool:
-    # NÃO faz retry em auth/permissão
     if isinstance(exc, (ccxt.AuthenticationError, ccxt.PermissionDenied, ccxt.AccountSuspended)):
         return False
 
@@ -413,10 +409,6 @@ def ohlcv_to_df(ohlcv: List[List[float]]) -> pd.DataFrame:
 
 
 def compute_signal(df: pd.DataFrame, cfg: Config) -> Tuple[bool, float, float]:
-    """
-    Retorna: (ok, curr_price, initial_stop)
-    Sem take profit.
-    """
     if len(df) < max(cfg.ema_period, cfg.rsi_period) + 5:
         return (False, 0.0, 0.0)
 
@@ -448,9 +440,8 @@ def get_top_symbols(client: BinanceClient, cfg: Config) -> List[str]:
     client.load_markets()
     tickers = client.fetch_tickers()
 
-    # ← LISTA EXPANDIDA DE STABLECOINS/PEGGED
     stablecoin_blacklist = {
-        "BUSD/USDT", "USDC/USDT", "DAI/USDT", "TUSD/USDT", "FDUSD/USDT",
+        "BUSD/USDT", "USDC/USDT", "DAI/USDT", "XUSD/USDT", "USD1/USDT", "BFUSD/USDT", "TUSD/USDT", "FDUSD/USDT",
         "EUR/USDT", "EURI/USDT", "GBP/USDT", "AUD/USDT", "USDE/USDT", "USDP/USDT",
         "PYUSD/USDT", "GUSD/USDT", "USDD/USDT", "USDN/USDT", "USDJ/USDT",
         "PAX/USDT", "HUSD/USDT", "SUSD/USDT", "CUSD/USDT", "FRAX/USDT",
@@ -465,16 +456,13 @@ def get_top_symbols(client: BinanceClient, cfg: Config) -> List[str]:
         if not s.endswith("/USDT"):
             continue
 
-        # Bloquear qualquer par começando com stablecoin ou fiat
         base = s.split("/")[0].upper()
         if base in ["EUR", "GBP", "AUD", "BUSD", "USDC", "DAI", "TUSD", "FDUSD", "USDE", "USDP", "PYUSD"]:
             continue
 
-        # Bloquear par completo (ex.: USDE/USDT)
         if s in stablecoin_blacklist:
             continue
 
-        # Excluir tokens alavancados
         if any(x in s for x in ["UP/", "DOWN/", "BEAR/", "BULL/"]):
             continue
 
@@ -700,19 +688,42 @@ class TradingBot:
         except Exception as e:
             logger.error(f"Erro ao tirar snapshot de equity: {e}")
 
-    def open_position(self, symbol: str, signal_price: float) -> None:
-        # 1 posição por par (máximo)
-        if symbol in self.positions:
+    def sync_positions_with_wallet(self) -> None:
+        """
+        Garante que não vamos contar como posição aberta algo que já foi
+        totalmente vendido manualmente (só sobrou USDT).
+        """
+        if not self.positions:
+            return
+        try:
+            balance = self.client.fetch_balance()
+        except Exception as e:
+            logger.warning(
+                f"Não foi possível sincronizar posições com saldo: {e}")
             return
 
-        # 5 posições no total (máximo)
+        removed: List[str] = []
+        for symbol in list(self.positions.keys()):
+            base = symbol.split("/")[0]
+            free = float(balance.get(base, {}).get("free", 0.0))
+            if free <= 0:
+                removed.append(symbol)
+                del self.positions[symbol]
+
+        if removed:
+            save_positions(self.cfg.positions_file, self.positions)
+            logger.info(
+                f"Removidas posições sem saldo real: {', '.join(removed)}")
+
+    def open_position(self, symbol: str, signal_price: float) -> None:
+        if symbol in self.positions:
+            return
         if not self.can_open_new_position():
             return
 
         try:
             market = self.client.market_info(symbol)
 
-            # minNotional / min cost
             min_cost = None
             limits = (market or {}).get("limits") or {}
             cost_limits = limits.get("cost") or {}
@@ -737,7 +748,6 @@ class TradingBot:
                     symbol).get("last") or signal_price
             avg_price = float(avg_price)
 
-            # stop inicial (hard)
             stop_exec = avg_price * (1.0 - self.cfg.stop_loss_pct)
 
             pos = Position(
@@ -771,12 +781,25 @@ class TradingBot:
                 f"ERRO COMPRA\nAtivo: {symbol}\nMotivo: {e}")
 
     def close_position(self, symbol: str, price: float, reason: str) -> None:
+        """
+        Usa o saldo REAL da carteira para vender, evitando erro de
+        'insufficient balance' em moedas tipo LUNC.
+        """
         pos = self.positions.get(symbol)
         if not pos:
             return
         try:
+            base_asset = symbol.split("/")[0]
+            balance = self.client.fetch_balance()
+            free_amount = float(balance.get(base_asset, {}).get("free", 0.0))
+
+            if free_amount <= 0:
+                logger.warning(
+                    f"Saldo livre de {base_asset} é zero, abortando venda de {symbol}.")
+                return
+
             amount_precise = self.client.amount_to_precision(
-                symbol, pos.amount)
+                symbol, free_amount)
             if amount_precise <= 0:
                 raise RuntimeError(
                     f"Quantidade inválida para vender: {amount_precise}")
@@ -846,19 +869,16 @@ class TradingBot:
                 pos = self.positions[symbol]
                 changed = False
 
-                # Atualiza topo (peak)
                 base_peak = pos.peak if pos.peak > 0 else pos.entry
                 if last > base_peak:
                     pos.peak = last
                     changed = True
 
-                # Armar trailing somente após +X% desde entrada
                 arm_price = pos.entry * (1.0 + self.cfg.trailing_activate_pct)
                 if (not pos.trailing_armed) and (last >= arm_price):
                     pos.trailing_armed = True
                     changed = True
 
-                # Se trailing armado, stop sobe com o peak (nunca desce)
                 if pos.trailing_armed:
                     trail_stop = pos.peak * (1.0 - self.cfg.trailing_stop_pct)
                     if trail_stop > pos.stop:
@@ -876,7 +896,6 @@ class TradingBot:
                     self.positions[symbol] = pos
                     save_positions(self.cfg.positions_file, self.positions)
 
-                # Saída: stop (antes de armar = stop loss; depois de armar = trailing stop)
                 if last <= pos.stop:
                     reason = "TRAILING STOP" if pos.trailing_armed else "STOP LOSS"
                     self.close_position(symbol, last, reason)
@@ -972,13 +991,16 @@ class TradingBot:
         logger.info("🤖 BOT INICIADO (BINANCE SPOT)")
         self.alerts.send("🤖 Bot iniciado e online!")
 
-        # relatório inicial
         self.send_daily_report()
         last_daily_report = time.time()
 
         while True:
             try:
-                # comandos Telegram (ex.: /status)
+                # Sincroniza posições com o saldo real (se você tiver só USDT,
+                # não conta mais como posição aberta)
+                self.sync_positions_with_wallet()
+
+                # Comandos Telegram
                 self.cmd.poll(self.handle_telegram_command)
 
                 symbols = self.refresh_symbols_if_needed()
